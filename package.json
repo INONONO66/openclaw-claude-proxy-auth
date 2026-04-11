@@ -1,0 +1,10 @@
+{
+  "name": "openclaw-claude-proxy-auth",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Claude Code OAuth proxy for Anthropic API",
+  "type": "module",
+  "openclaw": {
+    "extensions": ["./index.js"]
+  }
+}

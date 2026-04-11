@@ -1,0 +1,13 @@
+{
+  "id": "claude-proxy-auth",
+  "enabledByDefault": true,
+  "providers": ["claude-proxy"],
+  "modelSupport": {
+    "modelPrefixes": ["claude-"]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
