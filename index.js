@@ -472,11 +472,48 @@ function transformPayload(payload) {
     });
   }
 
-  // 6. Strip trailing assistant prefill — OAuth tokens don't allow it
+  // 6. Sanitize trailing assistant messages for OAuth compatibility
   if (Array.isArray(payload.messages) && payload.messages.length > 0) {
     const last = payload.messages[payload.messages.length - 1];
     if (last?.role === "assistant") {
-      payload.messages = payload.messages.slice(0, -1);
+      const blocks = Array.isArray(last.content) ? last.content : [];
+      const hasToolUse = blocks.some(b => b?.type === "tool_use");
+      const hasText = blocks.some(b => b?.type === "text" && b.text?.trim());
+
+      if (!hasToolUse && !hasText) {
+        // Empty or whitespace-only assistant message — remove
+        payload.messages = payload.messages.slice(0, -1);
+      } else if (!hasToolUse) {
+        // Pure text prefill without tool_use — OAuth rejects this
+        payload.messages = payload.messages.slice(0, -1);
+      }
+      // If hasToolUse: keep it — it's real conversation history
+    }
+
+    // 7. Repair orphaned tool_use: ensure every tool_use has a matching tool_result
+    for (let i = 0; i < payload.messages.length - 1; i++) {
+      const msg = payload.messages[i];
+      if (msg?.role !== "assistant") continue;
+      const toolUseBlocks = (Array.isArray(msg.content) ? msg.content : [])
+        .filter(b => b?.type === "tool_use");
+      if (toolUseBlocks.length === 0) continue;
+
+      const nextMsg = payload.messages[i + 1];
+      const nextBlocks = Array.isArray(nextMsg?.content) ? nextMsg.content : [];
+      const resultIds = new Set(
+        nextBlocks.filter(b => b?.type === "tool_result").map(b => b.tool_use_id)
+      );
+
+      const orphaned = toolUseBlocks.filter(b => !resultIds.has(b.id));
+      if (orphaned.length > 0 && nextMsg?.role === "user") {
+        const syntheticResults = orphaned.map(b => ({
+          type: "tool_result",
+          tool_use_id: b.id,
+          content: "[tool result unavailable — session resumed]",
+          is_error: true,
+        }));
+        nextMsg.content = [...syntheticResults, ...nextBlocks];
+      }
     }
   }
 
@@ -581,30 +618,13 @@ export default {
 
             if (transformed && Array.isArray(transformed.messages)) {
               const lastMsg = transformed.messages[transformed.messages.length - 1];
-              if (lastMsg?.role === "assistant") {
-                console.error(
-                  `[claude-proxy-auth] Stripping trailing assistant prefill (${transformed.messages.length} msgs)`
-                );
-              }
-              while (
-                transformed.messages.length > 0 &&
-                transformed.messages[transformed.messages.length - 1]?.role === "assistant"
-              ) {
-                transformed.messages.pop();
-              }
+              // transformPayload already handles prefill stripping and orphan repair
             }
 
             return originalOnPayload
               ? originalOnPayload(transformed, payloadModel)
               : transformed;
           };
-
-          if (Array.isArray(context?.messages) && context.messages.length > 0) {
-            const last = context.messages[context.messages.length - 1];
-            if (last?.role === "assistant") {
-              context = { ...context, messages: context.messages.slice(0, -1) };
-            }
-          }
 
           return baseStreamFn(model, context, {
             ...options,
