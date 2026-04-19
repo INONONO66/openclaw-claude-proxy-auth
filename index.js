@@ -115,27 +115,57 @@ const DEFAULT_PROP_RENAMES = [
 
 let cachedCredential = null;
 let refreshPromise = null;
+let currentCredIndex = 0;
 
-function findCredentialFile() {
+function findAllCredentialFiles() {
   const dir = join(homedir(), ".cli-proxy-api");
   try {
     const files = readdirSync(dir);
-    const match = files.find(
-      (f) => f.startsWith("claude-") && f.endsWith(".json")
-    );
-    if (match) return join(dir, match);
+    return files
+      .filter((f) => f.startsWith("claude-") && f.endsWith(".json"))
+      .map((f) => join(dir, f));
   } catch {
-    return null;
+    return [];
   }
+}
+
+function loadCredentialFromFile(file) {
+  const data = JSON.parse(readFileSync(file, "utf8"));
+  if (data.disabled) return null;
+  return { ...data, _file: file };
+}
+
+function reloadCredentialFromDisk(file) {
+  try {
+    const fresh = loadCredentialFromFile(file);
+    if (fresh && !isExpired(fresh)) {
+      cachedCredential = fresh;
+      return fresh;
+    }
+  } catch { /* file may not exist anymore */ }
   return null;
 }
 
 function loadCredential() {
-  const file = findCredentialFile();
-  if (!file)
+  const files = findAllCredentialFiles();
+  if (files.length === 0)
     throw new Error("No credential file in ~/.cli-proxy-api/");
-  const data = JSON.parse(readFileSync(file, "utf8"));
-  cachedCredential = { ...data, _file: file };
+
+  // Try current index first, then rotate through all files
+  for (let i = 0; i < files.length; i++) {
+    const idx = (currentCredIndex + i) % files.length;
+    try {
+      const cred = loadCredentialFromFile(files[idx]);
+      if (cred) {
+        currentCredIndex = idx;
+        cachedCredential = cred;
+        return cred;
+      }
+    } catch { continue; }
+  }
+  // Fallback: load first file regardless
+  const data = JSON.parse(readFileSync(files[0], "utf8"));
+  cachedCredential = { ...data, _file: files[0] };
   return cachedCredential;
 }
 
@@ -145,44 +175,92 @@ function isExpired(cred) {
   return Date.now() > expiry - 5 * 60 * 1000;
 }
 
+async function refreshSingleToken(cred) {
+  const res = await fetch(TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      grant_type: "refresh_token",
+      refresh_token: cred.refresh_token,
+      client_id: CLIENT_ID,
+    }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Token refresh failed (${res.status}): ${text}`);
+  }
+
+  const data = await res.json();
+  const now = new Date();
+  const expiresIn = data.expires_in || 3600;
+  const expiry = new Date(now.getTime() + expiresIn * 1000);
+
+  const updated = {
+    ...cred,
+    access_token: data.access_token,
+    refresh_token: data.refresh_token || cred.refresh_token,
+    expired: expiry.toISOString(),
+    last_refresh: now.toISOString(),
+  };
+
+  delete updated._file;
+  writeFileSync(cred._file, JSON.stringify(updated, null, 2));
+
+  return { ...updated, _file: cred._file };
+}
+
 async function refreshToken(cred) {
   if (refreshPromise) return refreshPromise;
 
   refreshPromise = (async () => {
     try {
-      const res = await fetch(TOKEN_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          grant_type: "refresh_token",
-          refresh_token: cred.refresh_token,
-          client_id: CLIENT_ID,
-        }),
-      });
+      // Step 1: Check if another process (cli-proxy-api) already refreshed
+      const reloaded = reloadCredentialFromDisk(cred._file);
+      if (reloaded) return reloaded;
 
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`Token refresh failed (${res.status}): ${text}`);
+      // Step 2: Try refreshing this credential
+      try {
+        const result = await refreshSingleToken(cred);
+        cachedCredential = result;
+        return result;
+      } catch (err) {
+        console.error(
+          `[claude-proxy-auth] Refresh failed for ${cred.email || cred._file}: ${err.message}`
+        );
+
+        // Step 3: Fallback — try other credential files
+        const allFiles = findAllCredentialFiles();
+        for (const file of allFiles) {
+          if (file === cred._file) continue;
+          try {
+            // First check if it's already fresh on disk
+            const alt = loadCredentialFromFile(file);
+            if (!alt) continue;
+            if (!isExpired(alt)) {
+              console.error(
+                `[claude-proxy-auth] Fallback to fresh credential: ${alt.email || file}`
+              );
+              cachedCredential = alt;
+              return alt;
+            }
+            // Try refreshing the alternative
+            const refreshed = await refreshSingleToken(alt);
+            console.error(
+              `[claude-proxy-auth] Fallback refresh succeeded: ${refreshed.email || file}`
+            );
+            cachedCredential = refreshed;
+            return refreshed;
+          } catch (altErr) {
+            console.error(
+              `[claude-proxy-auth] Fallback also failed for ${file}: ${altErr.message}`
+            );
+            continue;
+          }
+        }
+
+        throw err; // All credentials exhausted
       }
-
-      const data = await res.json();
-      const now = new Date();
-      const expiresIn = data.expires_in || 3600;
-      const expiry = new Date(now.getTime() + expiresIn * 1000);
-
-      const updated = {
-        ...cred,
-        access_token: data.access_token,
-        refresh_token: data.refresh_token || cred.refresh_token,
-        expired: expiry.toISOString(),
-        last_refresh: now.toISOString(),
-      };
-
-      delete updated._file;
-      writeFileSync(cred._file, JSON.stringify(updated, null, 2));
-
-      cachedCredential = { ...updated, _file: cred._file };
-      return cachedCredential;
     } finally {
       refreshPromise = null;
     }
@@ -193,6 +271,13 @@ async function refreshToken(cred) {
 
 async function ensureFreshToken() {
   let cred = cachedCredential || loadCredential();
+
+  // Always re-read from disk to pick up tokens refreshed by cli-proxy-api
+  if (cred?._file) {
+    const diskCred = reloadCredentialFromDisk(cred._file);
+    if (diskCred) cred = diskCred;
+  }
+
   if (isExpired(cred)) {
     cred = await refreshToken(cred);
   }
@@ -387,6 +472,14 @@ function transformPayload(payload) {
     });
   }
 
+  // 6. Strip trailing assistant prefill — OAuth tokens don't allow it
+  if (Array.isArray(payload.messages) && payload.messages.length > 0) {
+    const last = payload.messages[payload.messages.length - 1];
+    if (last?.role === "assistant") {
+      payload.messages = payload.messages.slice(0, -1);
+    }
+  }
+
   return payload;
 }
 
@@ -481,7 +574,37 @@ export default {
           }
 
           const headers = buildClaudeCodeHeaders(token);
-          const onPayload = (payload) => transformPayload(payload);
+          const originalOnPayload = options?.onPayload;
+
+          const onPayload = (payload, payloadModel) => {
+            const transformed = transformPayload(payload);
+
+            if (transformed && Array.isArray(transformed.messages)) {
+              const lastMsg = transformed.messages[transformed.messages.length - 1];
+              if (lastMsg?.role === "assistant") {
+                console.error(
+                  `[claude-proxy-auth] Stripping trailing assistant prefill (${transformed.messages.length} msgs)`
+                );
+              }
+              while (
+                transformed.messages.length > 0 &&
+                transformed.messages[transformed.messages.length - 1]?.role === "assistant"
+              ) {
+                transformed.messages.pop();
+              }
+            }
+
+            return originalOnPayload
+              ? originalOnPayload(transformed, payloadModel)
+              : transformed;
+          };
+
+          if (Array.isArray(context?.messages) && context.messages.length > 0) {
+            const last = context.messages[context.messages.length - 1];
+            if (last?.role === "assistant") {
+              context = { ...context, messages: context.messages.slice(0, -1) };
+            }
+          }
 
           return baseStreamFn(model, context, {
             ...options,
