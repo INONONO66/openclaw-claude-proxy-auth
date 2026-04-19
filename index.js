@@ -10,7 +10,7 @@ const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
 const BILLING_HASH_SALT = "59cf53e54c78";
 const BILLING_HASH_INDICES = [4, 7, 20];
-const TOOL_PREFIX = "mcp_";
+const TOOL_PREFIX = "";
 const CLAUDE_CODE_IDENTITY =
   "You are Claude Code, Anthropic's official CLI for Claude.";
 const OPENCODE_IDENTITY =
@@ -75,6 +75,13 @@ const DEFAULT_TOOL_RENAMES = [
   ["tts", "Speech"],
   ["gateway", "SystemCtl"],
   ["agents_list", "AgentList"],
+  ["sessions_list", "TaskList"],
+  ["sessions_history", "TaskHistory"],
+  ["sessions_send", "TaskSend"],
+  ["sessions_spawn", "TaskCreate"],
+  ["sessions_yield", "TaskYield"],
+  ["sessions_yield_interrupt", "TaskYieldInterrupt"],
+  ["sessions_store", "TaskStore"],
   ["list_tasks", "TaskList"],
   ["get_history", "TaskHistory"],
   ["send_to_task", "TaskSend"],
@@ -109,6 +116,29 @@ const DEFAULT_PROP_RENAMES = [
   ["agent_id", "worker_id"],
   ["wake_at", "trigger_at"],
   ["wake_event", "trigger_event"],
+];
+
+const DEFAULT_REVERSE_MAP = [
+  ["OCPlatform", "OpenClaw"],
+  ["ocplatform", "openclaw"],
+  ["create_task", "sessions_spawn"],
+  ["list_tasks", "sessions_list"],
+  ["get_history", "sessions_history"],
+  ["send_to_task", "sessions_send"],
+  ["task_yield_interrupt", "sessions_yield_interrupt"],
+  ["yield_task", "sessions_yield"],
+  ["task_store", "sessions_store"],
+  ["HB_ACK", "HEARTBEAT_OK"],
+  ["HB_SIGNAL", "HEARTBEAT"],
+  ["hb_signal", "heartbeat"],
+  ["assistant_bot", "clawbot"],
+  ["AssistantBot", "ClawBot"],
+  ["ASSISTANT_BOT", "CLAWBOT"],
+  ["platform-gateway", "openclaw-gateway"],
+  ["Platform Gateway", "OpenClaw Gateway"],
+  ["platform_hub", "clawdhub"],
+  ["PlatformHub", "ClawdHub"],
+  ["PLATFORM_HUB", "CLAWDHUB"],
 ];
 
 // === CREDENTIAL MANAGEMENT ===
@@ -332,17 +362,12 @@ function sanitizeSystemText(text) {
     result = result.split(from).join(to);
   }
 
-  // Strip large structured system config (>2000 chars) — keep first paragraph + short paraphrase
-  if (result.length > 2000) {
-    const firstParagraphEnd = result.indexOf("\n\n");
-    if (firstParagraphEnd > 0) {
-      const firstParagraph = result.slice(0, firstParagraphEnd).trim();
-      result =
-        firstParagraph +
-        "\n\nYou have access to various tools to help complete tasks. " +
-        "Use them as needed to assist the user effectively. " +
-        "Follow the user's instructions carefully and provide helpful, accurate responses.";
-    }
+  const genericSummary = "You are an AI operations assistant with access to the tools attached to this request for command execution, file inspection, search, browsing, scheduling, messaging, and task coordination. Use the provided tools directly, keep answers concise, and follow the user's instructions carefully.";
+  const structuredMarker = result.indexOf("\n## ");
+  if (structuredMarker !== -1 && result.length - structuredMarker > 1200) {
+    result = genericSummary;
+  } else if (result.length > 600) {
+    result = genericSummary;
   }
 
   return result.trim();
@@ -355,6 +380,191 @@ function applyStringReplacements(text) {
     result = result.split(from).join(to);
   }
   return result;
+}
+
+function applyReverseStringReplacements(text) {
+  if (!text) return text;
+  let result = text;
+  for (const [from, to] of DEFAULT_REVERSE_MAP) {
+    result = result.split(from).join(to);
+  }
+  return result;
+}
+
+function reverseToolName(name) {
+  if (!name || typeof name !== "string") return name;
+  const lower = name.toLowerCase();
+  const unprefixed = lower.startsWith(TOOL_PREFIX) ? lower.slice(TOOL_PREFIX.length) : lower;
+  for (const [orig, renamed] of DEFAULT_TOOL_RENAMES) {
+    if (unprefixed === renamed.toLowerCase()) return orig;
+  }
+  return unprefixed;
+}
+
+function reverseKnownProperties(record) {
+  if (!record || typeof record !== "object") return record;
+  let next = record;
+  for (const [orig, renamed] of DEFAULT_PROP_RENAMES) {
+    if (renamed in next) {
+      const value = next[renamed];
+      next = { ...next, [orig]: value };
+      delete next[renamed];
+    }
+  }
+  return next;
+}
+
+function reverseContentBlock(block) {
+  if (!block || typeof block !== "object") return block;
+  let next = reverseKnownProperties(block);
+  if (next.type === "text" && typeof next.text === "string") {
+    next = { ...next, text: applyReverseStringReplacements(next.text) };
+  }
+  if (next.type === "tool_use" && typeof next.name === "string") {
+    next = { ...next, name: reverseToolName(next.name) };
+  }
+  if (Array.isArray(next.content)) {
+    next = { ...next, content: next.content.map(reverseContentBlock) };
+  } else if (typeof next.content === "string") {
+    next = { ...next, content: applyReverseStringReplacements(next.content) };
+  }
+  return next;
+}
+
+function reverseMessageForOpenClaw(message) {
+  if (!message || typeof message !== "object") return message;
+  let next = { ...message };
+  if (typeof next.content === "string") {
+    next.content = applyReverseStringReplacements(next.content);
+  } else if (Array.isArray(next.content)) {
+    next.content = next.content.map(reverseContentBlock);
+  }
+  if (typeof next.errorMessage === "string") {
+    next.errorMessage = applyReverseStringReplacements(next.errorMessage);
+  }
+  if (typeof next.toolName === "string") {
+    next.toolName = reverseToolName(next.toolName);
+  }
+  if (typeof next.name === "string") {
+    next.name = reverseToolName(next.name);
+  }
+  return reverseKnownProperties(next);
+}
+
+function reverseAssistantEventForOpenClaw(event) {
+  if (!event || typeof event !== "object") return event;
+  const next = { ...event };
+  if (typeof next.toolName === "string") next.toolName = reverseToolName(next.toolName);
+  if (typeof next.name === "string") next.name = reverseToolName(next.name);
+  if (next.type === "text_delta" && typeof next.delta === "string") {
+    next.delta = applyReverseStringReplacements(next.delta);
+  }
+  if (next.type === "text_end" && typeof next.content === "string") {
+    next.content = applyReverseStringReplacements(next.content);
+  }
+  if (next.type === "content_block_start" && next.content_block) {
+    next.content_block = reverseContentBlock(next.content_block);
+  }
+  if (next.type === "content_block_delta" && next.delta && typeof next.delta.text === "string") {
+    next.delta = { ...next.delta, text: applyReverseStringReplacements(next.delta.text) };
+  }
+  if (Object.hasOwn(next, "partial")) next.partial = reverseMessageForOpenClaw(next.partial);
+  if (Object.hasOwn(next, "message")) next.message = reverseMessageForOpenClaw(next.message);
+  if (Object.hasOwn(next, "error")) next.error = reverseMessageForOpenClaw(next.error);
+  return reverseKnownProperties(next);
+}
+
+function stripSchemaMetadata(value) {
+  if (Array.isArray(value)) return value.map(stripSchemaMetadata);
+  if (!value || typeof value !== "object") return value;
+  const out = {};
+  for (const [k, v] of Object.entries(value)) {
+    if (["description", "title", "default", "examples", "$schema", "markdownDescription"].includes(k)) continue;
+    out[k] = stripSchemaMetadata(v);
+  }
+  return out;
+}
+
+function relocateSanitizedSystemToFirstUser(payload) {
+  if (!payload || !Array.isArray(payload.system) || payload.system.length <= 1) return payload;
+
+  const kept = [];
+  const movedTexts = [];
+  for (const entry of payload.system) {
+    if (entry?.type === "text" && typeof entry.text === "string") {
+      if (entry.text.includes("x-anthropic-billing-header:") || entry.text.includes(CLAUDE_CODE_IDENTITY)) {
+        kept.push(entry);
+      } else if (entry.text.trim()) {
+        movedTexts.push(entry.text.trim());
+      }
+      continue;
+    }
+    kept.push(entry);
+  }
+
+  if (movedTexts.length === 0 || !Array.isArray(payload.messages)) {
+    payload.system = kept;
+    return payload;
+  }
+
+  const prefix = movedTexts.join("\n\n");
+  const firstUser = payload.messages.find((m) => m?.role === "user");
+  if (!firstUser) {
+    payload.system = kept;
+    payload.messages.unshift({
+      role: "user",
+      content: [{ type: "text", text: prefix }],
+    });
+    return payload;
+  }
+
+  if (typeof firstUser.content === "string") {
+    firstUser.content = `${prefix}
+
+${firstUser.content}`;
+  } else if (Array.isArray(firstUser.content)) {
+    firstUser.content = [{ type: "text", text: prefix }, ...firstUser.content];
+  } else {
+    firstUser.content = [{ type: "text", text: prefix }];
+  }
+  payload.system = kept;
+  return payload;
+}
+
+function wrapResponseStreamForOpenClaw(stream) {
+  if (!stream || typeof stream !== "object") return stream;
+  if (typeof stream.result === "function") {
+    const originalResult = stream.result.bind(stream);
+    stream.result = async () => reverseMessageForOpenClaw(await originalResult());
+  }
+  if (typeof stream[Symbol.asyncIterator] === "function") {
+    const originalAsyncIterator = stream[Symbol.asyncIterator].bind(stream);
+    stream[Symbol.asyncIterator] = function () {
+      const iterator = originalAsyncIterator();
+      return {
+        async next() {
+          const result = await iterator.next();
+          return result.done ? result : { done: false, value: reverseAssistantEventForOpenClaw(result.value) };
+        },
+        async return(value) {
+          return iterator.return?.(value) ?? { done: true, value: void 0 };
+        },
+        async throw(error) {
+          return iterator.throw?.(error) ?? { done: true, value: void 0 };
+        },
+        [Symbol.asyncIterator]() {
+          return this;
+        },
+      };
+    };
+  }
+  return stream;
+}
+
+function dumpPayloadSnapshot(payload) {
+  try {
+    writeFileSync('/tmp/openclaw-claude-proxy-last-payload.json', JSON.stringify(payload, null, 2));
+  } catch {}
 }
 
 function transformPayload(payload) {
@@ -372,17 +582,22 @@ function transformPayload(payload) {
       ? [rawSystem]
       : [];
   const sanitizedSystem = existingSystem
-    .map((block, i) => {
-      if (i === 0) return block;
-      if (typeof block === "string")
+    .map((block) => {
+      if (typeof block === "string") {
+        if (block.includes(CLAUDE_CODE_IDENTITY)) return { type: "text", text: block };
         return { type: "text", text: sanitizeSystemText(block) };
-      if (block?.type === "text")
+      }
+      if (block?.type === "text") {
+        if (typeof block.text === "string" && block.text.includes(CLAUDE_CODE_IDENTITY)) return block;
         return { ...block, text: sanitizeSystemText(block.text) };
+      }
       return block;
     })
     .filter((b) => b?.text !== "");
 
   payload.system = [billingBlock, ...sanitizedSystem];
+  relocateSanitizedSystemToFirstUser(payload);
+  dumpPayloadSnapshot(payload);
 
   // 3. Apply string replacements to messages
   if (Array.isArray(payload.messages)) {
@@ -404,14 +619,7 @@ function transformPayload(payload) {
             }
             // Rename tool_use names
             if (block.type === "tool_use" && block.name) {
-              let name = TOOL_PREFIX + block.name;
-              for (const [orig, renamed] of DEFAULT_TOOL_RENAMES) {
-                if (block.name === orig) {
-                  name = TOOL_PREFIX + renamed;
-                  break;
-                }
-              }
-              return { ...block, name };
+              return { ...block, name: normalizeOutboundToolName(block.name) };
             }
             // Rename tool_result tool names
             if (block.type === "tool_result" && block.tool_use_id) {
@@ -430,18 +638,9 @@ function transformPayload(payload) {
   if (Array.isArray(payload.tools)) {
     payload.tools = payload.tools.map((tool) => {
       if (!tool) return tool;
-      let name = tool.name || "";
-      // Apply tool renames first, then prefix
-      for (const [orig, renamed] of DEFAULT_TOOL_RENAMES) {
-        if (name === orig) {
-          name = renamed;
-          break;
-        }
-      }
-      name = TOOL_PREFIX + name;
       return {
         ...tool,
-        name,
+        name: normalizeOutboundToolName(tool.name || ""),
         description: "", // strip descriptions to reduce fingerprint signal
       };
     });
@@ -472,11 +671,48 @@ function transformPayload(payload) {
     });
   }
 
-  // 6. Strip trailing assistant prefill — OAuth tokens don't allow it
+  // 6. Sanitize trailing assistant messages for OAuth compatibility
   if (Array.isArray(payload.messages) && payload.messages.length > 0) {
     const last = payload.messages[payload.messages.length - 1];
     if (last?.role === "assistant") {
-      payload.messages = payload.messages.slice(0, -1);
+      const blocks = Array.isArray(last.content) ? last.content : [];
+      const hasToolUse = blocks.some(b => b?.type === "tool_use");
+      const hasText = blocks.some(b => b?.type === "text" && b.text?.trim());
+
+      if (!hasToolUse && !hasText) {
+        // Empty or whitespace-only assistant message — remove
+        payload.messages = payload.messages.slice(0, -1);
+      } else if (!hasToolUse) {
+        // Pure text prefill without tool_use — OAuth rejects this
+        payload.messages = payload.messages.slice(0, -1);
+      }
+      // If hasToolUse: keep it — it's real conversation history
+    }
+
+    // 7. Repair orphaned tool_use: ensure every tool_use has a matching tool_result
+    for (let i = 0; i < payload.messages.length - 1; i++) {
+      const msg = payload.messages[i];
+      if (msg?.role !== "assistant") continue;
+      const toolUseBlocks = (Array.isArray(msg.content) ? msg.content : [])
+        .filter(b => b?.type === "tool_use");
+      if (toolUseBlocks.length === 0) continue;
+
+      const nextMsg = payload.messages[i + 1];
+      const nextBlocks = Array.isArray(nextMsg?.content) ? nextMsg.content : [];
+      const resultIds = new Set(
+        nextBlocks.filter(b => b?.type === "tool_result").map(b => b.tool_use_id)
+      );
+
+      const orphaned = toolUseBlocks.filter(b => !resultIds.has(b.id));
+      if (orphaned.length > 0 && nextMsg?.role === "user") {
+        const syntheticResults = orphaned.map(b => ({
+          type: "tool_result",
+          tool_use_id: b.id,
+          content: "[tool result unavailable — session resumed]",
+          is_error: true,
+        }));
+        nextMsg.content = [...syntheticResults, ...nextBlocks];
+      }
     }
   }
 
@@ -532,6 +768,36 @@ function buildClaudeCodeHeaders(token) {
 
 // === PLUGIN EXPORT ===
 
+function normalizeOutboundToolName(name) {
+  if (!name || typeof name !== "string") return name;
+  if (name.startsWith(TOOL_PREFIX)) return name;
+  let next = name;
+  for (const [orig, renamed] of DEFAULT_TOOL_RENAMES) {
+    if (next === orig) {
+      next = renamed;
+      break;
+    }
+  }
+  return TOOL_PREFIX + next;
+}
+
+function renameToolForClaude(tool) {
+  if (!tool || typeof tool !== "object") return tool;
+  let name = tool.name || "";
+  for (const [orig, renamed] of DEFAULT_TOOL_RENAMES) {
+    if (name === orig) {
+      name = renamed;
+      break;
+    }
+  }
+  return {
+    ...tool,
+    name: TOOL_PREFIX + name,
+    description: "",
+    input_schema: stripSchemaMetadata(tool.input_schema || {}),
+  };
+}
+
 export default {
   id: "claude-proxy-auth",
   name: "Claude Proxy Auth",
@@ -544,6 +810,7 @@ export default {
       docsPath: "/providers/models",
       envVars: [],
       auth: [],
+      normalizeToolSchemas: ({ tools }) => Array.isArray(tools) ? tools.map(renameToolForClaude) : tools,
       resolveSyntheticAuth: () => {
         try {
           const cred = cachedCredential || loadCredential();
@@ -574,44 +841,37 @@ export default {
           }
 
           const headers = buildClaudeCodeHeaders(token);
-          const originalOnPayload = options?.onPayload;
 
-          const onPayload = (payload, payloadModel) => {
-            const transformed = transformPayload(payload);
-
-            if (transformed && Array.isArray(transformed.messages)) {
-              const lastMsg = transformed.messages[transformed.messages.length - 1];
-              if (lastMsg?.role === "assistant") {
-                console.error(
-                  `[claude-proxy-auth] Stripping trailing assistant prefill (${transformed.messages.length} msgs)`
-                );
-              }
-              while (
-                transformed.messages.length > 0 &&
-                transformed.messages[transformed.messages.length - 1]?.role === "assistant"
-              ) {
-                transformed.messages.pop();
+          if (Array.isArray(context?.messages) && context.messages.length > 0) {
+            const last = context.messages[context.messages.length - 1];
+            if (last?.role === "assistant") {
+              const blocks = Array.isArray(last.content) ? last.content : [];
+              const hasToolUse = blocks.some((b) => b?.type === "tool_use");
+              if (!hasToolUse) {
+                context = { ...context, messages: context.messages.slice(0, -1) };
               }
             }
+          }
 
+          const originalOnPayload = options?.onPayload;
+          const onPayload = (payload, payloadModel) => {
+            const transformed = transformPayload(payload);
             return originalOnPayload
               ? originalOnPayload(transformed, payloadModel)
               : transformed;
           };
 
-          if (Array.isArray(context?.messages) && context.messages.length > 0) {
-            const last = context.messages[context.messages.length - 1];
-            if (last?.role === "assistant") {
-              context = { ...context, messages: context.messages.slice(0, -1) };
-            }
-          }
-
-          return baseStreamFn(model, context, {
+          const maybeStream = baseStreamFn(model, context, {
             ...options,
             headers,
             onPayload,
             apiKey: token,
           });
+
+          if (maybeStream && typeof maybeStream === "object" && "then" in maybeStream) {
+            return Promise.resolve(maybeStream).then((stream) => wrapResponseStreamForOpenClaw(stream));
+          }
+          return wrapResponseStreamForOpenClaw(maybeStream);
 
         };
       },
